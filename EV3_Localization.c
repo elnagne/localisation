@@ -77,7 +77,7 @@ static int next_follow_alignment_colour=1;
 static int intersection_axle_centered=0;
 // Only the first intersection search may accept yellow without a black departure.
 static int acquiring_first_intersection=0;
-static int street_follow_power=10;
+static int street_follow_power=5;
 static int street_test_main(int argc,char **argv);
 static int geometry_check_main(int argc,char **argv);
 
@@ -298,8 +298,7 @@ const char *get_colour_name(int colour)
 int beep(void)
 {
  int tones[50][3]={{880,200,25},{-1,-1,-1}};
- // return BT_play_tone_sequence(tones);
- return 0;
+ return BT_play_tone_sequence(tones);
 }
 
 int turn_at_intersection(int turn_direction)
@@ -565,9 +564,31 @@ static int recover_from_red_boundary(void)
   fprintf(stderr,"Street reacquisition failed after boundary turnaround; stopping without another turn.\n");
   return 0;
  }
- if (wiggle_to_black()) return 1;
- fprintf(stderr,"Black not found by recovery wipe; running full street alignment.\n");
- return align_to_street();
+ int colour=sample_alignment_colour();
+ if (colour<0||BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return 0;
+ if (colour==4)
+ {
+  int confirmation=sample_alignment_colour();
+  if (confirmation==4)
+  {
+   printf("Confirmed yellow during boundary return; using it as the returned intersection.\n");
+   return 2;
+  }
+ }
+ int recovery=continuous_recovery_sweep();
+ if (recovery==4)
+ {
+  if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0||sample_alignment_colour()!=4)
+  {
+   fprintf(stderr,"Yellow found during boundary return did not remain confirmed while stopped.\n");
+   return 0;
+  }
+  printf("Confirmed yellow during boundary recovery sweep; using it as the returned intersection.\n");
+  return 2;
+ }
+ if (recovery==1&&center_on_alignment_marker(1)) return 1;
+ fprintf(stderr,"Black or yellow not reacquired during boundary return; stopping without another alignment sweep.\n");
+ return 0;
 }
 
 static int drive_to_next_intersection(int *direction,int *boundary_return)
@@ -588,13 +609,24 @@ static int drive_to_next_intersection(int *direction,int *boundary_return)
    fprintf(stderr,"Street following failed before reaching an intersection.\n");
    return 0;
   }
-  if (attempt==1||!recover_from_red_boundary())
+  if (attempt==1)
+  {
+   fprintf(stderr,"Could not recover from the red boundary.\n");
+   return 0;
+  }
+  int recovery=recover_from_red_boundary();
+  if (recovery==0)
   {
    fprintf(stderr,"Could not recover from the red boundary.\n");
    return 0;
   }
   *direction=(*direction+2)%4;
   recovered_boundary=1;
+  if (recovery==2)
+  {
+   *boundary_return=1;
+   return 1;
+  }
  }
  return 0;
 }
@@ -730,6 +762,26 @@ int update_beliefs_from_scan(const int observed[4])
   }
 
   return 1;
+}
+
+static void print_belief_matrix(void)
+{
+ printf("Belief matrix by intersection; each cell is [up, right, down, left]\n");
+ printf("       ");
+ for (int x=0;x<sx;x++) printf("       x=%-2d                  ",x);
+ printf("\n");
+ for (int y=0;y<sy;y++)
+ {
+  printf("y=%-2d  ",y);
+  for (int x=0;x<sx;x++)
+  {
+   int index=y*sx+x;
+   printf("[%0.3f,%0.3f,%0.3f,%0.3f] ",
+     beliefs[index][0],beliefs[index][1],beliefs[index][2],beliefs[index][3]);
+  }
+  printf("\n");
+ }
+ fflush(stdout);
 }
 
 int update_beliefs_after_turn(int turn_direction)
@@ -949,6 +1001,7 @@ int robot_localization(int *robot_x, int *robot_y, int *direction)
    fprintf(stderr,"Belief update failed.\n");
    return 0;
   }
+  print_belief_matrix();
 
   int best_index=0,best_heading=0;
   double best_probability=-1.0,second_probability=0.0,total=0.0;
@@ -1371,7 +1424,7 @@ int load_colour_calibration(const char *directory)
 
  // Learn the achromatic saturation gate and black/white brightness boundary from these captures.
  double neutral_saturation_max=0.0;
- double chromatic_saturation_min=1.0;
+ double chromatic_saturation_floor=1.0;
  double black_value_max=0.0;
  double nonblack_value_min=HUGE_VAL;
  double white_value_min=1.0;
@@ -1388,10 +1441,34 @@ int load_colour_calibration(const char *directory)
     if (colour==1&&value>black_value_max) black_value_max=value;
     if (colour==6&&value<white_value_min) white_value_min=value;
    }
-   else if (saturation<chromatic_saturation_min)
-    chromatic_saturation_min=saturation;
   }
- hsv_neutral_saturation_threshold=(neutral_saturation_max+chromatic_saturation_min)/2.0;
+ for (int colour=2;colour<=5;colour++)
+ {
+  double saturations[CALIBRATION_SAMPLES_PER_COLOUR];
+  int count=0;
+  for (int colour_index=0;colour_index<6;colour_index++)
+   if (calibration_map_ids[colour_index]==colour)
+    for (int sample=0;sample<CALIBRATION_SAMPLES_PER_COLOUR;sample++)
+    {
+     double hue,saturation,value;
+     rgb_to_hsv(colour_calibration_samples[colour_index][sample],&hue,&saturation,&value);
+     saturations[count++]=saturation;
+    }
+  for (int index=1;index<count;index++)
+  {
+   double value=saturations[index];
+   int position=index;
+   while (position>0&&saturations[position-1]>value)
+   {
+    saturations[position]=saturations[position-1];
+    position--;
+   }
+   saturations[position]=value;
+  }
+  if (count>0&&saturations[count/10]<chromatic_saturation_floor)
+   chromatic_saturation_floor=saturations[count/10];
+ }
+ hsv_neutral_saturation_threshold=(neutral_saturation_max+chromatic_saturation_floor)/2.0;
  hsv_black_white_value_threshold=(black_value_max+white_value_min)/2.0;
  // Low NXT readings can have a strong channel tint even on black. Use brightness
  // before hue/saturation only when the captures demonstrate a black/nonblack gap.
@@ -1889,14 +1966,14 @@ int calibrate_sensor(void)
 }
 
 // ---- Smooth movement: gyro-held straight drives and gyro-controlled turns ----
-#define MOVE_CRUISE_POWER 8
-#define MOVE_MIN_POWER 8
+#define MOVE_CRUISE_POWER 5
+#define MOVE_MIN_POWER 5
 #define MOVE_RAMP_UP_MS 500
 #define MOVE_RAMP_DOWN_DEGREES 90.0
-#define MOVE_HEADING_GAIN 1.5
+#define MOVE_HEADING_GAIN 0.5
 #define MOVE_HEADING_LIMIT 8
 #define TURN_MIN_POWER 10
-#define TURN_MAX_POWER 20
+#define TURN_MAX_POWER 15
 #define TURN_GAIN 0.6
 #define TURN_TOLERANCE_DEGREES 3
 #define TURN_SETTLE_US 150000
@@ -2327,7 +2404,7 @@ static int follow_black_street(void)
  intersection_axle_centered=0;
  const double max_forward_revolutions=2;
  const int timeout_ms=60000;
- const int follow_power=street_follow_power;
+ const int follow_power=street_follow_power>2 ? 2 : street_follow_power;
  const int steering_correction_limit=follow_power<8 ? follow_power/2 : 4;
  int angle,rate,right_previous,left_previous;
  int alignment_colour=next_follow_alignment_colour;
@@ -2397,7 +2474,12 @@ static int follow_black_street(void)
   }
   if (colour==5)
   {
-   stop_with(STOP_COLOUR,colour);
+    MoveResult stopped=stop_with(STOP_COLOUR,colour);
+    if (stopped.reason!=STOP_COLOUR)
+    {
+     fprintf(stderr,"Unable to brake at the red boundary; stopping street follow.\n");
+     return 0;
+    }
    printf("Red boundary reached.\n");
    return 2;
   }
@@ -2442,8 +2524,11 @@ static int follow_black_street(void)
     int correction=(int)(MOVE_HEADING_GAIN*angle);
     if (correction>steering_correction_limit) correction=steering_correction_limit;
     if (correction< -steering_correction_limit) correction=-steering_correction_limit;
-    if (BT_turn(MOTOR_C,follow_power-correction,
-      MOTOR_B,follow_power+correction)!=0)
+    int left_power=follow_power-correction;
+    int right_power=follow_power+correction;
+    if (left_power>2) left_power=2;
+    if (right_power>2) right_power=2;
+    if (BT_turn(MOTOR_C,left_power,MOTOR_B,right_power)!=0)
   {
    BT_motor_port_stop(MOTOR_B|MOTOR_C,1);
    return 0;

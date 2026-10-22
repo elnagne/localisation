@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define MOTOR_B 2
+#define MOTOR_C 4
 typedef enum {STOP_ERROR=-1,STOP_TIMEOUT=0,STOP_DISTANCE=1,STOP_COLOUR=2,STOP_ANGLE=3} StopReason;
 typedef struct {StopReason reason;int colour;} MoveResult;
 #define FIND_STREET_MAX_REV 1.1
@@ -16,8 +18,8 @@ static MoveResult search_results[4];
 static int search_count,search_calls;
 static StopReason turn_results[3];
 static int turn_count,turn_calls;
-static int wipe_ok,alignment_ok,sweep_colour;
-static int wipe_calls,alignment_calls,sweep_calls;
+static int sweep_colour,reacquired_colour,brake_calls;
+static int center_calls,sweep_calls,sample_calls,sample_sequence[8],sample_sequence_count;
 static int physical_heading,initial_heading,commands_valid;
 
 static MoveResult turn_in_place(int degrees,int direction,int timeout)
@@ -44,9 +46,15 @@ static int drive_along_street(void)
  int result=drive_calls<drive_count ? drive_results[drive_calls] : 0;
  drive_calls++;return result;
 }
-static int wiggle_to_black(void) {wipe_calls++;return wipe_ok;}
-static int align_to_street(void) {alignment_calls++;return alignment_ok;}
+static int center_on_alignment_marker(int colour) {center_calls++;return colour==1;}
 static int continuous_recovery_sweep(void) {sweep_calls++;return sweep_colour;}
+static int sample_alignment_colour(void)
+{
+ int index=sample_calls++;
+ return index<sample_sequence_count ? sample_sequence[index] : reacquired_colour;
+}
+static int BT_motor_port_stop(int ports,int brake)
+{if (ports!=(MOTOR_B|MOTOR_C)||brake!=1) commands_valid=0;brake_calls++;return 0;}
 static int report_move_result(const char *label,MoveResult result)
 {(void)label;(void)result;return 0;}
 
@@ -60,11 +68,12 @@ static int report_move_result(const char *label,MoveResult result)
 static void reset(int heading)
 {
  initial_heading=physical_heading=heading;
- drive_calls=search_calls=turn_calls=wipe_calls=alignment_calls=sweep_calls=0;
+ drive_calls=search_calls=turn_calls=center_calls=sweep_calls=sample_calls=brake_calls=0;
+ sample_sequence_count=0;
  drive_count=2;drive_results[0]=2;drive_results[1]=1;
  turn_count=1;turn_results[0]=STOP_ANGLE;
  search_count=1;search_results[0].reason=STOP_COLOUR;search_results[0].colour=1;
- wipe_ok=alignment_ok=1;sweep_colour=1;commands_valid=1;
+ sweep_colour=1;reacquired_colour=1;commands_valid=1;
  sx=sy=3;
  memset(beliefs,0,sizeof(beliefs));
 }
@@ -83,7 +92,8 @@ static int red_return(void)
  int heading=initial_heading,boundary=-1;
  CHECK(drive_to_next_intersection(&heading,&boundary));
  CHECK(boundary==1&&heading==(initial_heading+2)%4&&heading==physical_heading);
- CHECK(turn_calls==1&&drive_calls==2&&search_calls==1&&wipe_calls==1&&commands_valid);
+ CHECK(turn_calls==1&&drive_calls==2&&search_calls==1&&sweep_calls>=1&&
+   center_calls==1&&commands_valid);
  const int edge[4]={1,5,7,3};
  beliefs[edge[initial_heading]][initial_heading]=1;
  CHECK(update_beliefs_after_forward(boundary));
@@ -98,21 +108,48 @@ static int red_return(void)
 }
 
 static int yellow_during_reacquisition(void)
-{search_results[0].colour=4;return red_return();}
-
-static int wipe_fallback(void)
 {
- wipe_ok=0;int heading=initial_heading,boundary=-1;
+ search_results[0].colour=4;
+ reacquired_colour=4;
+ int heading=initial_heading,boundary=-1;
  CHECK(drive_to_next_intersection(&heading,&boundary));
- CHECK(boundary==1&&heading==physical_heading&&alignment_calls==1&&turn_calls==1);
+ CHECK(boundary==1&&heading==(initial_heading+2)%4&&heading==physical_heading);
+ CHECK(turn_calls==1&&drive_calls==1&&search_calls==1&&sweep_calls==0&&sample_calls==2);
+ const int edge[4]={1,5,7,3};
+ beliefs[edge[initial_heading]][initial_heading]=1;
+ CHECK(update_beliefs_after_forward(boundary));
+ CHECK(beliefs[edge[initial_heading]][heading]>0.95);
+ return 1;
+}
+
+static int yellow_during_return_wipe(void)
+{
+ sweep_colour=4;reacquired_colour=1;
+ sample_sequence[0]=1;sample_sequence[1]=4;sample_sequence[2]=4;sample_sequence_count=3;
+ int heading=initial_heading,boundary=-1;
+ CHECK(drive_to_next_intersection(&heading,&boundary));
+ CHECK(boundary==1&&heading==(initial_heading+2)%4&&heading==physical_heading);
+ CHECK(turn_calls==1&&drive_calls==1&&search_calls==1&&sweep_calls==1&&sample_calls==2);
+ const int edge[4]={1,5,7,3};
+ beliefs[edge[initial_heading]][initial_heading]=1;
+ CHECK(update_beliefs_after_forward(boundary));
+ CHECK(beliefs[edge[initial_heading]][heading]>0.95);
+ return 1;
+}
+
+static int black_reacquired_after_yellow_miss(void)
+{
+ reacquired_colour=6;int heading=initial_heading,boundary=-1;
+ CHECK(drive_to_next_intersection(&heading,&boundary));
+ CHECK(boundary==1&&heading==physical_heading&&center_calls==1&&sweep_calls==1&&turn_calls==1);
  return 1;
 }
 
 static int failed_alignment(void)
 {
- wipe_ok=alignment_ok=0;int heading=initial_heading,boundary=-1;
+ sweep_colour=0;reacquired_colour=6;int heading=initial_heading,boundary=-1;
  CHECK(!drive_to_next_intersection(&heading,&boundary));
- CHECK(boundary==0&&drive_calls==1&&alignment_calls==1);
+ CHECK(boundary==0&&drive_calls==1&&sweep_calls==1);
  return 1;
 }
 
@@ -128,7 +165,7 @@ static int failed_search(void)
 {
  search_results[0].reason=STOP_ERROR;int heading=initial_heading,boundary=-1;
  CHECK(!drive_to_next_intersection(&heading,&boundary));
- CHECK(boundary==0&&wipe_calls==0&&drive_calls==1);
+ CHECK(boundary==0&&sweep_calls==0&&drive_calls==1);
  return 1;
 }
 
@@ -215,7 +252,9 @@ int main(void)
  struct Test {const char *name;int (*run)(void);} tests[]={
   {"direct_yellow",direct_yellow},{"red_return_same_intersection",red_return},
   {"yellow_during_reacquisition",yellow_during_reacquisition},
-  {"wipe_fallback_alignment",wipe_fallback},{"failed_alignment",failed_alignment},
+  {"yellow_during_return_wipe",yellow_during_return_wipe},
+    {"black_reacquired_after_yellow_miss",black_reacquired_after_yellow_miss},
+    {"failed_black_recovery_stops",failed_alignment},
   {"turn_timeout",failed_turn},{"sensor_search_error",failed_search},
   {"search_timeout_recovered",timed_search_recovered},{"search_timeout_failed",timed_search_failed},
   {"return_trip_failure",failed_return_trip},{"repeated_red_bounded",repeated_red_is_bounded},

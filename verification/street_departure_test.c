@@ -6,7 +6,8 @@
 #define MOTOR_C 4
 #define GYRO_SENSOR_PORT 1
 #define MOVE_HEADING_GAIN 1.0
-typedef enum {STOP_COLOUR=2} StopReason;
+typedef enum {STOP_ERROR=-1,STOP_COLOUR=2} StopReason;
+typedef struct {StopReason reason;int colour;} MoveResult;
 static int intersection_axle_centered,next_follow_alignment_colour,street_follow_power=10;
 static int acquiring_first_intersection;
 static int events[8],event_count,event_index,motor_calls,brake_calls,wheel_calls;
@@ -24,11 +25,15 @@ static int read_wheel_degrees(int *right,int *left) {*right=*left=++wheel_calls*
 static int BT_motor_port_stop(int ports,int brake)
 {assert(ports==6&&brake==1);return ++brake_calls==brake_failure ? -1 : 0;}
 static int BT_turn(int first,int power1,int second,int power2)
-{assert(first==4&&second==2&&power1==10&&power2==10);motor_calls++;return 0;}
+{assert(first==4&&second==2&&power1==2&&power2==2);motor_calls++;return 0;}
 static int sample_street_event_colour(void)
 {int index=event_index++;return events[index<event_count ? index : event_count-1];}
-static int stop_with(StopReason reason,int colour)
-{assert(reason==STOP_COLOUR&&(colour==4||colour==5));brake_calls++;return 0;}
+static MoveResult stop_with(StopReason reason,int colour)
+{
+ assert(reason==STOP_COLOUR&&(colour==4||colour==5));
+ MoveResult result={BT_motor_port_stop(MOTOR_B|MOTOR_C,1)==0 ? reason : STOP_ERROR,colour};
+ return result;
+}
 static const char *get_colour_name(int colour) {(void)colour;return "fixture";}
 static int recover_black_heading(void) {return recovery_colour;}
 #include "street_departure_under_test.inc"
@@ -55,6 +60,8 @@ int main(void)
  assert(follow_black_street()==1&&event_index==6);
  const int red[]={5};reset(red,1);
  assert(follow_black_street()==2&&motor_calls==0&&brake_calls==1);
+ reset(red,1);brake_failure=1;
+ assert(follow_black_street()==0&&motor_calls==0&&brake_calls==1);
  const int error[]={-1};reset(error,1);
  assert(follow_black_street()==0&&motor_calls==0&&brake_calls==1);
  const int lost_before_departure[]={6};reset(lost_before_departure,1);recovery_colour=4;
@@ -80,6 +87,6 @@ int main(void)
  assert(follow_black_street()==2&&motor_calls==0&&brake_calls==1);
  reset(normal,3);brake_failure=1;
  assert(follow_black_street()==0&&brake_calls==1); /* Arrival requires successful braking. */
- puts("18/18 initial-yellow, later-departure, arrival and failure cases passed.");
+ puts("19/19 initial-yellow, later-departure, arrival, red-brake and failure cases passed.");
  return 0;
 }

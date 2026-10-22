@@ -19,4 +19,7 @@ with tempfile.TemporaryDirectory(prefix='c85_colours_') as name:
     executable=work/'classifier'
     subprocess.run(['g++',str(ROOT/'verification/colour_classifier_test.cpp'),
                     str(ROOT/'EV3_RobotControl/btcomm.c'),'-lbluetooth','-o',str(executable)],check=True)
-    subprocess.run([str(executable),str(work/'separated'),str(work/'overlap')],check=True)
+    command=[str(executable),str(work/'separated'),str(work/'overlap')]
+    run5=ROOT/'calibration'/'run-5'
+    if run5.is_dir(): command.append(str(run5))
+    subprocess.run(command,check=True)
